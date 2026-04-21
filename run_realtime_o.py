@@ -66,6 +66,9 @@ def smape(y_true, y_pred):
     y_pred = np.asarray(y_pred, dtype=float)
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100.0)
 
+# =========================
+# Data fetch
+# =========================
 def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_col=PRICE_COL):
     df = yf.download(
         tickers=ticker,
@@ -92,7 +95,12 @@ def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_co
     out = out.rename(columns={price_col: "target"})
     return out
 
+# =========================
+# Chronos input builder
+# =========================
 def build_chronos_df(history_df):
+    # Use synthetic regular 5-minute timestamps so Chronos can infer frequency
+    # without being affected by overnight or market-closure gaps.
     synthetic_ts = pd.date_range(
         start="2000-01-01 00:00:00",
         periods=len(history_df),
@@ -113,12 +121,18 @@ def extract_p50(pred_df):
     value_cols = [c for c in pred_df.columns if c not in ("id", "timestamp")]
     return pred_df[value_cols[-1]].to_numpy(dtype=float)
 
+# =========================
+# Model loading
+# =========================
 def get_pipeline():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Torch device: {device}")
     pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map=device)
     return pipeline
 
+# =========================
+# Forecasting
+# =========================
 def latest_observation_forecast(pipeline, series_df):
     if len(series_df) < CONTEXT_LEN:
         raise ValueError(f"Need at least {CONTEXT_LEN} rows, got {len(series_df)}.")
@@ -148,6 +162,9 @@ def latest_observation_forecast(pipeline, series_df):
         "predictions": [float(x) for x in preds],
     }
 
+# =========================
+# Evaluation
+# =========================
 def score_ready_forecasts(series_df, forecasts_store):
     evaluations = []
     index_list = list(series_df.index)
@@ -211,7 +228,9 @@ def save_evaluations_csv(all_forecasts):
     if rows:
         eval_df = pd.DataFrame(rows).sort_values("origin_ts")
     else:
-        eval_df = pd.DataFrame(columns=["origin_ts","actual_end_ts","mae","rmse","smape","ticker","interval","context_len","horizon_len"])
+        eval_df = pd.DataFrame(
+            columns=["origin_ts", "actual_end_ts", "mae", "rmse", "smape", "ticker", "interval", "context_len", "horizon_len"]
+        )
 
     eval_df.to_csv(EVALUATIONS_CSV, index=False)
 
@@ -243,6 +262,9 @@ def save_evaluations_csv(all_forecasts):
     summary.to_csv(SUMMARY_CSV, index=False)
     return eval_df, summary
 
+# =========================
+# Output files
+# =========================
 def save_latest_forecast_csv(forecast_obj):
     origin_ts = pd.Timestamp(forecast_obj["origin_ts"])
     pred_df = pd.DataFrame({
@@ -272,8 +294,10 @@ def save_latest_plot(series_df, forecast_obj):
 def save_metrics_plot(eval_df):
     if eval_df.empty:
         return
+
     plot_df = eval_df.copy()
     plot_df["origin_ts"] = pd.to_datetime(plot_df["origin_ts"])
+
     plt.figure(figsize=(12, 5))
     plt.plot(plot_df["origin_ts"], plot_df["mae"], label="MAE", marker="o")
     plt.plot(plot_df["origin_ts"], plot_df["rmse"], label="RMSE", marker="o")
@@ -287,6 +311,9 @@ def save_metrics_plot(eval_df):
     plt.savefig(METRICS_PLOT, dpi=160)
     plt.close()
 
+# =========================
+# Main cycle
+# =========================
 def run_cycle(pipeline):
     print("\n" + "=" * 80)
     print(f"Cycle started at UTC: {datetime.utcnow().isoformat()}")
