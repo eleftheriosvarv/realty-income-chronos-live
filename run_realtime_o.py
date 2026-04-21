@@ -99,16 +99,16 @@ def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_co
 # Chronos input builder
 # =========================
 def build_chronos_df(history_df):
-    # Use synthetic regular 5-minute timestamps so Chronos can infer frequency
-    # without being affected by overnight or market-closure gaps.
+    # Use synthetic regular 5-minute timestamps so Chronos can infer a stable frequency.
     synthetic_ts = pd.date_range(
         start="2000-01-01 00:00:00",
         periods=len(history_df),
         freq="5min"
     )
 
+    # Use numeric id to avoid the known string-id frequency inference issue.
     return pd.DataFrame({
-        "id": ["series"] * len(history_df),
+        "id": np.zeros(len(history_df), dtype=np.int64),
         "timestamp": synthetic_ts,
         "target": history_df["target"].astype("float32").values,
     })
