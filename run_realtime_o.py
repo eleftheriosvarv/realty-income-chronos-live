@@ -106,13 +106,8 @@ def extract_median_forecast(raw_forecast, horizon):
 
     arr = np.squeeze(arr)
 
-    # Expected common cases:
-    # 1D: [prediction_length]
-    # 2D: [num_samples, prediction_length] or [prediction_length, num_quantiles]
-    # 3D: [num_series, num_samples, prediction_length]
     if arr.ndim == 1:
         preds = arr[:horizon]
-
     elif arr.ndim == 2:
         if arr.shape[1] == horizon and arr.shape[0] != horizon:
             preds = np.median(arr, axis=0)
@@ -120,7 +115,6 @@ def extract_median_forecast(raw_forecast, horizon):
             preds = np.median(arr, axis=1)
         else:
             preds = np.median(arr, axis=0)[:horizon]
-
     elif arr.ndim == 3:
         arr0 = arr[0]
         if arr0.shape[1] == horizon:
