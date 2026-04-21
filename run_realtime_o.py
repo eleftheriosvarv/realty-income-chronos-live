@@ -66,6 +66,9 @@ def smape(y_true, y_pred):
     y_pred = np.asarray(y_pred, dtype=float)
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100.0)
 
+# =========================
+# Data fetch
+# =========================
 def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_col=PRICE_COL):
     df = yf.download(
         tickers=ticker,
@@ -92,45 +95,18 @@ def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_co
     out = out.rename(columns={price_col: "target"})
     return out
 
+# =========================
+# Model loading
+# =========================
 def get_pipeline():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Torch device: {device}")
     pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map=device)
     return pipeline
 
-def extract_median_forecast(raw_forecast, horizon):
-    if isinstance(raw_forecast, torch.Tensor):
-        arr = raw_forecast.detach().cpu().numpy()
-    else:
-        arr = np.asarray(raw_forecast)
-
-    arr = np.squeeze(arr)
-
-    if arr.ndim == 1:
-        preds = arr[:horizon]
-    elif arr.ndim == 2:
-        if arr.shape[1] == horizon and arr.shape[0] != horizon:
-            preds = np.median(arr, axis=0)
-        elif arr.shape[0] == horizon and arr.shape[1] != horizon:
-            preds = np.median(arr, axis=1)
-        else:
-            preds = np.median(arr, axis=0)[:horizon]
-    elif arr.ndim == 3:
-        arr0 = arr[0]
-        if arr0.shape[1] == horizon:
-            preds = np.median(arr0, axis=0)
-        elif arr0.shape[0] == horizon:
-            preds = np.median(arr0, axis=1)
-        else:
-            preds = np.median(arr0, axis=0)[:horizon]
-    else:
-        raise ValueError(f"Unexpected forecast output shape: {arr.shape}")
-
-    preds = np.asarray(preds, dtype=float).reshape(-1)
-    if len(preds) < horizon:
-        raise ValueError(f"Forecast shorter than horizon: got {len(preds)}, expected {horizon}")
-    return preds[:horizon]
-
+# =========================
+# Forecasting
+# =========================
 def latest_observation_forecast(pipeline, series_df):
     if len(series_df) < CONTEXT_LEN:
         raise ValueError(f"Need at least {CONTEXT_LEN} rows, got {len(series_df)}.")
@@ -138,17 +114,48 @@ def latest_observation_forecast(pipeline, series_df):
     context_df = series_df.iloc[-CONTEXT_LEN:].copy()
     origin_ts = context_df.index[-1]
 
-    context_values = torch.tensor(
-        context_df["target"].astype("float32").values,
-        dtype=torch.float32
+    # Use synthetic regular timestamps so Chronos sees a perfectly regular 5-minute series.
+    synthetic_ts = pd.date_range(
+        start="2000-01-01 00:00:00",
+        periods=len(context_df),
+        freq="5min"
     )
 
-    raw_forecast = pipeline.predict(
-        context=context_values,
+    # Use numeric id to avoid string-id edge cases.
+    chronos_input = pd.DataFrame({
+        "id": np.zeros(len(context_df), dtype=np.int64),
+        "timestamp": synthetic_ts,
+        "target": context_df["target"].astype(np.float32).values,
+    })
+
+    pred_df = pipeline.predict_df(
+        chronos_input,
         prediction_length=HORIZON_LEN,
+        quantile_levels=[0.5],
+        id_column="id",
+        timestamp_column="timestamp",
+        target="target",
     )
 
-    preds = extract_median_forecast(raw_forecast, HORIZON_LEN)
+    rows_0 = pred_df[pred_df["id"] == 0]
+
+    if len(rows_0) == 0:
+        raise RuntimeError("Chronos returned no rows for series id 0.")
+
+    if "0.5" in rows_0.columns:
+        preds = rows_0["0.5"].to_numpy(dtype=float)
+    elif "predictions" in rows_0.columns:
+        preds = rows_0["predictions"].to_numpy(dtype=float)
+    else:
+        value_cols = [c for c in rows_0.columns if c not in ("id", "timestamp")]
+        if not value_cols:
+            raise RuntimeError(f"Could not find prediction column in Chronos output: {list(rows_0.columns)}")
+        preds = rows_0[value_cols[-1]].to_numpy(dtype=float)
+
+    preds = np.asarray(preds, dtype=float).reshape(-1)
+    if len(preds) < HORIZON_LEN:
+        raise RuntimeError(f"Chronos returned only {len(preds)} predictions, expected {HORIZON_LEN}.")
+    preds = preds[:HORIZON_LEN]
 
     return {
         "origin_ts": origin_ts.isoformat(),
@@ -161,6 +168,9 @@ def latest_observation_forecast(pipeline, series_df):
         "predictions": [float(x) for x in preds],
     }
 
+# =========================
+# Evaluation
+# =========================
 def score_ready_forecasts(series_df, forecasts_store):
     evaluations = []
     index_list = list(series_df.index)
@@ -258,6 +268,9 @@ def save_evaluations_csv(all_forecasts):
     summary.to_csv(SUMMARY_CSV, index=False)
     return eval_df, summary
 
+# =========================
+# Output files
+# =========================
 def save_latest_forecast_csv(forecast_obj):
     origin_ts = pd.Timestamp(forecast_obj["origin_ts"])
     pred_df = pd.DataFrame({
@@ -304,6 +317,9 @@ def save_metrics_plot(eval_df):
     plt.savefig(METRICS_PLOT, dpi=160)
     plt.close()
 
+# =========================
+# Main cycle
+# =========================
 def run_cycle(pipeline):
     print("\n" + "=" * 80)
     print(f"Cycle started at UTC: {datetime.utcnow().isoformat()}")
