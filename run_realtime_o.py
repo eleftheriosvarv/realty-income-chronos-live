@@ -93,9 +93,15 @@ def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_co
     return out
 
 def build_chronos_df(history_df):
+    synthetic_ts = pd.date_range(
+        start="2000-01-01 00:00:00",
+        periods=len(history_df),
+        freq="5min"
+    )
+
     return pd.DataFrame({
         "id": ["series"] * len(history_df),
-        "timestamp": history_df.index,
+        "timestamp": synthetic_ts,
         "target": history_df["target"].astype("float32").values,
     })
 
