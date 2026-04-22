@@ -1,2 +1,2 @@
 ticker,interval,n_evaluated_blocks,mean_mae,mean_rmse,mean_smape,median_mae,median_rmse,median_smape
-O,5m,0,,,,,,
+O,5m,1,0.1477238337198893,0.19355853904069706,0.23083129594416157,0.1477238337198893,0.19355853904069706,0.23083129594416157
