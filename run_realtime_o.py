@@ -1,392 +1,614 @@
-import os
+# =========================================================
+# REAL-TIME REALTY INCOME (O) FORECASTING WITH CHRONOS-2
+# - Fetches latest 5-minute data from Yahoo Finance
+# - Creates a 24-step forecast
+# - Stores forecast blocks in JSON
+# - Scores completed forecast blocks once actuals are available
+# - Saves:
+#     1) latest_forecast.csv
+#     2) latest_forecast_plot.png
+#     3) latest_evaluated_forecast_plot.png
+#     4) evaluations.csv
+#     5) evaluation_summary.csv
+#     6) metrics_history.png
+# =========================================================
+
 import json
-import time
+import warnings
 from pathlib import Path
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import torch
-from chronos import Chronos2Pipeline
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# =========================
-# User configuration
-# =========================
+import torch
+import yfinance as yf
+from chronos import Chronos2Pipeline
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# USER SETTINGS
+# =========================================================
 TICKER = "O"
 INTERVAL = "5m"
-PERIOD = "60d"
-PRICE_COL = "Close"
+YF_PERIOD = "60d"
+
+MODEL_NAME = "amazon/chronos-2"
 
 CONTEXT_LEN = 2048
 HORIZON_LEN = 24
-POLL_EVERY_MINUTES = 5
-
-# IMPORTANT:
-# For GitHub Actions, keep RUN_FOREVER=False and MAX_CYCLES=1.
-RUN_FOREVER = False
-MAX_CYCLES = 1
+NUM_SAMPLES = 20
 
 STATE_DIR = Path("realtime_o_chronos2_state")
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-FORECASTS_FILE = STATE_DIR / "forecasts.json"
-EVALUATIONS_CSV = STATE_DIR / "evaluations.csv"
+FORECASTS_JSON = STATE_DIR / "forecasts.json"
 LATEST_FORECAST_CSV = STATE_DIR / "latest_forecast.csv"
-SUMMARY_CSV = STATE_DIR / "evaluation_summary.csv"
 LATEST_PLOT = STATE_DIR / "latest_forecast_plot.png"
+LATEST_EVALUATED_PLOT = STATE_DIR / "latest_evaluated_forecast_plot.png"
+EVALUATIONS_CSV = STATE_DIR / "evaluations.csv"
+EVALUATION_SUMMARY_CSV = STATE_DIR / "evaluation_summary.csv"
 METRICS_PLOT = STATE_DIR / "metrics_history.png"
 
-# =========================
-# Helpers
-# =========================
-def save_json(path, obj):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+EPS = 1e-8
 
-def load_json(path, default):
+# =========================================================
+# GLOBAL MODEL CACHE
+# =========================================================
+_PIPELINE = None
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def now_iso():
+    return pd.Timestamp.utcnow().isoformat()
+
+
+def load_json_list(path: Path):
     if not path.exists():
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
-def mae(y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    return float(np.mean(np.abs(y_true - y_pred)))
 
-def rmse(y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+def save_json(path: Path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
 
-def smape(y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    return float(np.mean(2.0 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)) * 100.0)
 
-# =========================
-# Data fetch
-# =========================
-def fetch_close_series(ticker=TICKER, period=PERIOD, interval=INTERVAL, price_col=PRICE_COL):
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def normalize_timestamp(ts):
+    ts = pd.Timestamp(ts)
+    if ts.tz is not None:
+        ts = ts.tz_convert(None)
+    return ts
+
+
+def smape(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    denom = np.abs(actual) + np.abs(pred) + EPS
+    return float(np.mean(200.0 * np.abs(pred - actual) / denom))
+
+
+def mae(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    return float(np.mean(np.abs(actual - pred)))
+
+
+def rmse(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    return float(np.sqrt(np.mean((actual - pred) ** 2)))
+
+
+def save_placeholder_plot(path: Path, title: str, message: str):
+    plt.figure(figsize=(12, 5))
+    plt.text(0.5, 0.5, message, ha="center", va="center", fontsize=12)
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+
+
+# =========================================================
+# DATA FETCHING
+# =========================================================
+def fetch_price_series():
     df = yf.download(
-        tickers=ticker,
-        period=period,
-        interval=interval,
+        TICKER,
+        period=YF_PERIOD,
+        interval=INTERVAL,
         auto_adjust=True,
         progress=False,
         prepost=False,
         threads=False,
+        group_by="column",
     )
 
     if df is None or df.empty:
         raise RuntimeError("No data returned from Yahoo Finance.")
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-    if price_col not in df.columns:
-        raise KeyError(f"Column '{price_col}' not found. Available columns: {list(df.columns)}")
-
-    out = df[[price_col]].copy()
-    out = out.dropna()
-    out.index = pd.to_datetime(out.index).tz_localize(None)
-    out = out.rename(columns={price_col: "target"})
-    return out
-
-# =========================
-# Model loading
-# =========================
-def get_pipeline():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Torch device: {device}")
-    pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", device_map=device)
-    return pipeline
-
-# =========================
-# Forecasting
-# =========================
-def latest_observation_forecast(pipeline, series_df):
-    if len(series_df) < CONTEXT_LEN:
-        raise ValueError(f"Need at least {CONTEXT_LEN} rows, got {len(series_df)}.")
-
-    context_df = series_df.iloc[-CONTEXT_LEN:].copy()
-    origin_ts = context_df.index[-1]
-
-    # Use synthetic regular timestamps so Chronos sees a perfectly regular 5-minute series.
-    synthetic_ts = pd.date_range(
-        start="2000-01-01 00:00:00",
-        periods=len(context_df),
-        freq="5min"
-    )
-
-    # Use numeric id to avoid string-id edge cases.
-    chronos_input = pd.DataFrame({
-        "id": np.zeros(len(context_df), dtype=np.int64),
-        "timestamp": synthetic_ts,
-        "target": context_df["target"].astype(np.float32).values,
-    })
-
-    pred_df = pipeline.predict_df(
-        chronos_input,
-        prediction_length=HORIZON_LEN,
-        quantile_levels=[0.5],
-        id_column="id",
-        timestamp_column="timestamp",
-        target="target",
-    )
-
-    rows_0 = pred_df[pred_df["id"] == 0]
-
-    if len(rows_0) == 0:
-        raise RuntimeError("Chronos returned no rows for series id 0.")
-
-    if "0.5" in rows_0.columns:
-        preds = rows_0["0.5"].to_numpy(dtype=float)
-    elif "predictions" in rows_0.columns:
-        preds = rows_0["predictions"].to_numpy(dtype=float)
+    if "Close" in df.columns:
+        close = df["Close"]
+    elif isinstance(df.columns, pd.MultiIndex):
+        try:
+            close = df.xs("Close", axis=1, level=0).iloc[:, 0]
+        except Exception as e:
+            raise RuntimeError(f"Could not extract Close column from Yahoo Finance output: {e}")
     else:
-        value_cols = [c for c in rows_0.columns if c not in ("id", "timestamp")]
-        if not value_cols:
-            raise RuntimeError(f"Could not find prediction column in Chronos output: {list(rows_0.columns)}")
-        preds = rows_0[value_cols[-1]].to_numpy(dtype=float)
+        raise RuntimeError("Close column not found in Yahoo Finance output.")
+
+    series_df = close.to_frame(name="target").copy()
+    series_df.index = pd.to_datetime(series_df.index)
+
+    if getattr(series_df.index, "tz", None) is not None:
+        series_df.index = series_df.index.tz_convert(None)
+
+    series_df = series_df[~series_df.index.duplicated(keep="last")]
+    series_df = series_df.sort_index().dropna()
+
+    if len(series_df) < CONTEXT_LEN:
+        raise RuntimeError(
+            f"Not enough observations. Need at least {CONTEXT_LEN}, got {len(series_df)}."
+        )
+
+    return series_df
+
+
+# =========================================================
+# MODEL
+# =========================================================
+def get_pipeline():
+    global _PIPELINE
+    if _PIPELINE is None:
+        use_cuda = torch.cuda.is_available()
+        dtype = torch.bfloat16 if use_cuda else torch.float32
+        device_map = "cuda" if use_cuda else "cpu"
+
+        _PIPELINE = Chronos2Pipeline.from_pretrained(
+            MODEL_NAME,
+            device_map=device_map,
+            torch_dtype=dtype,
+        )
+    return _PIPELINE
+
+
+def generate_forecast(series_df):
+    pipeline = get_pipeline()
+
+    context_values = series_df["target"].values.astype(np.float32)[-CONTEXT_LEN:]
+    context_tensor = torch.tensor(context_values)
+
+    forecast_raw = pipeline.predict(
+        context=context_tensor,
+        prediction_length=HORIZON_LEN,
+        num_samples=NUM_SAMPLES,
+    )
+
+    arr = to_numpy(forecast_raw)
+
+    # Try to support common Chronos output shapes robustly
+    # Possible shapes:
+    #   (num_samples, horizon)
+    #   (1, num_samples, horizon)
+    #   (horizon,)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 2:
+        preds = np.median(arr, axis=0)
+    elif arr.ndim == 1:
+        preds = arr
+    else:
+        raise RuntimeError(f"Unexpected forecast output shape: {arr.shape}")
 
     preds = np.asarray(preds, dtype=float).reshape(-1)
-    if len(preds) < HORIZON_LEN:
-        raise RuntimeError(f"Chronos returned only {len(preds)} predictions, expected {HORIZON_LEN}.")
-    preds = preds[:HORIZON_LEN]
 
-    return {
+    if len(preds) != HORIZON_LEN:
+        preds = preds[:HORIZON_LEN]
+
+    origin_ts = normalize_timestamp(series_df.index[-1])
+
+    forecast_obj = {
+        "ticker": TICKER,
+        "interval": INTERVAL,
         "origin_ts": origin_ts.isoformat(),
-        "created_at_utc": datetime.utcnow().isoformat(),
+        "created_at": now_iso(),
         "context_len": CONTEXT_LEN,
         "horizon_len": HORIZON_LEN,
-        "price_col": PRICE_COL,
-        "interval": INTERVAL,
-        "ticker": TICKER,
         "predictions": [float(x) for x in preds],
+        "evaluated": False,
     }
+    return forecast_obj
 
-# =========================
-# Evaluation
-# =========================
+
+# =========================================================
+# FORECAST STORE
+# =========================================================
+def deduplicate_forecasts(forecasts_store):
+    keep = {}
+    for f in forecasts_store:
+        key = f.get("origin_ts")
+        if key is None:
+            continue
+        keep[key] = f
+    out = list(keep.values())
+    out = sorted(out, key=lambda x: x["origin_ts"])
+    return out
+
+
+def maybe_append_new_forecast(forecasts_store, new_forecast):
+    existing_keys = {f.get("origin_ts") for f in forecasts_store}
+    if new_forecast["origin_ts"] not in existing_keys:
+        forecasts_store.append(new_forecast)
+    return deduplicate_forecasts(forecasts_store)
+
+
+def get_latest_forecast(forecasts_store):
+    if not forecasts_store:
+        return None
+    return sorted(forecasts_store, key=lambda x: x["origin_ts"])[-1]
+
+
+# =========================================================
+# EVALUATION
+# =========================================================
 def score_ready_forecasts(series_df, forecasts_store):
-    evaluations = []
     index_list = list(series_df.index)
+    index_map = {normalize_timestamp(ts): i for i, ts in enumerate(index_list)}
 
     for forecast in forecasts_store:
         if forecast.get("evaluated", False):
             continue
 
-        origin_ts = pd.Timestamp(forecast["origin_ts"])
-        if origin_ts not in series_df.index:
+        origin_ts = normalize_timestamp(forecast["origin_ts"])
+
+        if origin_ts not in index_map:
             continue
 
-        origin_pos = index_list.index(origin_ts)
-        end_pos = origin_pos + HORIZON_LEN
+        origin_pos = index_map[origin_ts]
 
-        if end_pos >= len(series_df):
+        # Need full actual block of length HORIZON_LEN after the forecast origin
+        if origin_pos + HORIZON_LEN >= len(series_df):
             continue
 
-        actual_block = series_df.iloc[origin_pos + 1 : origin_pos + 1 + HORIZON_LEN]["target"].to_numpy(dtype=float)
+        actual_series = series_df.iloc[
+            origin_pos + 1 : origin_pos + 1 + HORIZON_LEN
+        ]["target"]
+
+        actual_block = actual_series.to_numpy(dtype=float)
         pred_block = np.asarray(forecast["predictions"], dtype=float)
 
-        if len(actual_block) != HORIZON_LEN or len(pred_block) != HORIZON_LEN:
+        n = min(len(actual_block), len(pred_block))
+        if n == 0:
             continue
 
-        forecast["evaluated"] = True
-        forecast["actual_end_ts"] = series_df.index[origin_pos + HORIZON_LEN].isoformat()
+        actual_block = actual_block[:n]
+        pred_block = pred_block[:n]
+        actual_timestamps = actual_series.index[:n]
+
+        forecast["actuals"] = [float(x) for x in actual_block]
+        forecast["actual_timestamps"] = [normalize_timestamp(ts).isoformat() for ts in actual_timestamps]
+
         forecast["mae"] = mae(actual_block, pred_block)
         forecast["rmse"] = rmse(actual_block, pred_block)
         forecast["smape"] = smape(actual_block, pred_block)
+        forecast["evaluated"] = True
+        forecast["evaluated_at"] = now_iso()
 
-        evaluations.append({
-            "origin_ts": forecast["origin_ts"],
-            "actual_end_ts": forecast["actual_end_ts"],
-            "mae": forecast["mae"],
-            "rmse": forecast["rmse"],
-            "smape": forecast["smape"],
-            "ticker": forecast["ticker"],
-            "interval": forecast["interval"],
-            "context_len": forecast["context_len"],
-            "horizon_len": forecast["horizon_len"],
-        })
+    return deduplicate_forecasts(forecasts_store)
 
-    return evaluations
 
-def save_evaluations_csv(all_forecasts):
+def build_evaluations_df(forecasts_store):
     rows = []
-    for f in all_forecasts:
+    for f in forecasts_store:
         if f.get("evaluated", False):
-            rows.append({
-                "origin_ts": f["origin_ts"],
-                "actual_end_ts": f.get("actual_end_ts"),
-                "mae": f.get("mae"),
-                "rmse": f.get("rmse"),
-                "smape": f.get("smape"),
-                "ticker": f.get("ticker"),
-                "interval": f.get("interval"),
-                "context_len": f.get("context_len"),
-                "horizon_len": f.get("horizon_len"),
-            })
+            rows.append(
+                {
+                    "ticker": f.get("ticker", TICKER),
+                    "interval": f.get("interval", INTERVAL),
+                    "origin_ts": f["origin_ts"],
+                    "created_at": f.get("created_at"),
+                    "evaluated_at": f.get("evaluated_at"),
+                    "mae": f.get("mae"),
+                    "rmse": f.get("rmse"),
+                    "smape": f.get("smape"),
+                }
+            )
 
-    if rows:
-        eval_df = pd.DataFrame(rows).sort_values("origin_ts")
-    else:
-        eval_df = pd.DataFrame(
-            columns=["origin_ts", "actual_end_ts", "mae", "rmse", "smape", "ticker", "interval", "context_len", "horizon_len"]
+    if not rows:
+        return pd.DataFrame(columns=["ticker", "interval", "origin_ts", "created_at", "evaluated_at", "mae", "rmse", "smape"])
+
+    df = pd.DataFrame(rows)
+    df["origin_ts"] = pd.to_datetime(df["origin_ts"])
+    df = df.sort_values("origin_ts").reset_index(drop=True)
+    return df
+
+
+def save_evaluation_summary(eval_df):
+    if eval_df.empty:
+        summary = pd.DataFrame(
+            [
+                {"metric": "mae", "mean": np.nan, "median": np.nan, "min": np.nan, "max": np.nan, "latest": np.nan, "n_evaluated": 0},
+                {"metric": "rmse", "mean": np.nan, "median": np.nan, "min": np.nan, "max": np.nan, "latest": np.nan, "n_evaluated": 0},
+                {"metric": "smape", "mean": np.nan, "median": np.nan, "min": np.nan, "max": np.nan, "latest": np.nan, "n_evaluated": 0},
+            ]
+        )
+        summary.to_csv(EVALUATION_SUMMARY_CSV, index=False)
+        return
+
+    rows = []
+    for metric in ["mae", "rmse", "smape"]:
+        vals = eval_df[metric].dropna().astype(float)
+        rows.append(
+            {
+                "metric": metric,
+                "mean": float(vals.mean()) if len(vals) else np.nan,
+                "median": float(vals.median()) if len(vals) else np.nan,
+                "min": float(vals.min()) if len(vals) else np.nan,
+                "max": float(vals.max()) if len(vals) else np.nan,
+                "latest": float(vals.iloc[-1]) if len(vals) else np.nan,
+                "n_evaluated": int(len(vals)),
+            }
         )
 
-    eval_df.to_csv(EVALUATIONS_CSV, index=False)
+    summary = pd.DataFrame(rows)
+    summary.to_csv(EVALUATION_SUMMARY_CSV, index=False)
 
-    if not eval_df.empty:
-        summary = pd.DataFrame([{
-            "ticker": TICKER,
-            "interval": INTERVAL,
-            "n_evaluated_blocks": len(eval_df),
-            "mean_mae": eval_df["mae"].mean(),
-            "mean_rmse": eval_df["rmse"].mean(),
-            "mean_smape": eval_df["smape"].mean(),
-            "median_mae": eval_df["mae"].median(),
-            "median_rmse": eval_df["rmse"].median(),
-            "median_smape": eval_df["smape"].median(),
-        }])
-    else:
-        summary = pd.DataFrame([{
-            "ticker": TICKER,
-            "interval": INTERVAL,
-            "n_evaluated_blocks": 0,
-            "mean_mae": np.nan,
-            "mean_rmse": np.nan,
-            "mean_smape": np.nan,
-            "median_mae": np.nan,
-            "median_rmse": np.nan,
-            "median_smape": np.nan,
-        }])
 
-    summary.to_csv(SUMMARY_CSV, index=False)
-    return eval_df, summary
-
-# =========================
-# Output files
-# =========================
+# =========================================================
+# CSV OUTPUTS
+# =========================================================
 def save_latest_forecast_csv(forecast_obj):
-    origin_ts = pd.Timestamp(forecast_obj["origin_ts"])
-    pred_df = pd.DataFrame({
-        "step_ahead": list(range(1, HORIZON_LEN + 1)),
-        "predicted": forecast_obj["predictions"],
-    })
-    pred_df.insert(0, "forecast_origin_ts", origin_ts.isoformat())
-    pred_df.to_csv(LATEST_FORECAST_CSV, index=False)
+    if forecast_obj is None:
+        pd.DataFrame(columns=["timestamp", "predicted_close"]).to_csv(LATEST_FORECAST_CSV, index=False)
+        return
 
+    origin_ts = normalize_timestamp(forecast_obj["origin_ts"])
+    preds = np.asarray(forecast_obj["predictions"], dtype=float)
+
+    future_index = pd.date_range(
+        start=origin_ts + pd.Timedelta(minutes=5),
+        periods=len(preds),
+        freq="5min",
+    )
+
+    out = pd.DataFrame(
+        {
+            "timestamp": future_index,
+            "predicted_close": preds,
+        }
+    )
+    out.to_csv(LATEST_FORECAST_CSV, index=False)
+
+
+# =========================================================
+# PLOTS
+# =========================================================
 def save_latest_plot(series_df, forecast_obj):
+    if forecast_obj is None:
+        save_placeholder_plot(
+            LATEST_PLOT,
+            f"{TICKER} | Latest Forecast",
+            "No forecast available yet."
+        )
+        return
+
     preds = np.asarray(forecast_obj["predictions"], dtype=float)
     hist = series_df.iloc[-200:].copy()
+    origin_ts = normalize_timestamp(forecast_obj["origin_ts"])
+
+    future_index = pd.date_range(
+        start=origin_ts + pd.Timedelta(minutes=5),
+        periods=len(preds),
+        freq="5min"
+    )
 
     plt.figure(figsize=(12, 5))
-    plt.plot(hist.index, hist["target"].values, label="Observed Close", linewidth=1.8)
-    future_x = list(range(len(hist), len(hist) + HORIZON_LEN))
-    plt.plot(future_x, preds, label="Chronos-2 forecast (next 24 bars)", linewidth=2.0)
-    plt.axvline(x=len(hist) - 1, linestyle="--", linewidth=1.2)
-    plt.title(f"{TICKER} | {INTERVAL} | Context={CONTEXT_LEN}, Horizon={HORIZON_LEN}")
-    plt.xlabel("Recent history + forecast steps")
+
+    plt.plot(
+        hist.index,
+        hist["target"].values,
+        label="Observed Close",
+        linewidth=1.8
+    )
+
+    plt.plot(
+        future_index,
+        preds,
+        label="Chronos-2 forecast (next 24 bars)",
+        linewidth=2.0,
+        marker="o"
+    )
+
+    plt.axvline(
+        x=origin_ts,
+        linestyle="--",
+        linewidth=1.2,
+        label="Forecast origin"
+    )
+
+    plt.title(f"{TICKER} | {INTERVAL} | Latest forecast | Context={CONTEXT_LEN}, Horizon={HORIZON_LEN}")
+    plt.xlabel("Timestamp")
     plt.ylabel("Price")
+    plt.grid(alpha=0.3)
     plt.legend()
+    plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(LATEST_PLOT, dpi=160)
     plt.close()
 
+
 def save_metrics_plot(eval_df):
     if eval_df.empty:
+        save_placeholder_plot(
+            METRICS_PLOT,
+            f"{TICKER} | Forecast accuracy by completed 24-bar block",
+            "No completed forecast blocks yet.\nWait until enough future actual bars are available."
+        )
         return
 
     plot_df = eval_df.copy()
     plot_df["origin_ts"] = pd.to_datetime(plot_df["origin_ts"])
 
     plt.figure(figsize=(12, 5))
-    plt.plot(plot_df["origin_ts"], plot_df["mae"], label="MAE", marker="o")
-    plt.plot(plot_df["origin_ts"], plot_df["rmse"], label="RMSE", marker="o")
-    plt.plot(plot_df["origin_ts"], plot_df["smape"], label="sMAPE", marker="o")
+    plt.plot(plot_df["origin_ts"], plot_df["mae"], marker="o", label="MAE")
+    plt.plot(plot_df["origin_ts"], plot_df["rmse"], marker="o", label="RMSE")
+    plt.plot(plot_df["origin_ts"], plot_df["smape"], marker="o", label="sMAPE")
+
     plt.title(f"{TICKER} | Forecast accuracy by completed 24-bar block")
     plt.xlabel("Forecast origin timestamp")
     plt.ylabel("Metric value")
-    plt.legend()
     plt.grid(alpha=0.3)
+    plt.legend()
+    plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(METRICS_PLOT, dpi=160)
     plt.close()
 
-# =========================
-# Main cycle
-# =========================
-def run_cycle(pipeline):
-    print("\n" + "=" * 80)
-    print(f"Cycle started at UTC: {datetime.utcnow().isoformat()}")
 
-    series_df = fetch_close_series()
-    latest_ts = series_df.index[-1]
-    print(f"Rows fetched: {len(series_df)}")
-    print(f"Latest observed bar: {latest_ts}")
+def save_latest_evaluated_forecast_plot(forecasts_store):
+    evaluated = [
+        f for f in forecasts_store
+        if f.get("evaluated", False)
+        and "actuals" in f
+        and "actual_timestamps" in f
+        and "predictions" in f
+    ]
 
-    if len(series_df) < CONTEXT_LEN:
-        print("Not enough rows for the requested context length yet.")
+    if not evaluated:
+        save_placeholder_plot(
+            LATEST_EVALUATED_PLOT,
+            f"{TICKER} | Latest evaluated forecast",
+            "No evaluated forecast yet.\nMetrics will appear after the next 24 real bars become available."
+        )
         return
 
-    forecasts_store = load_json(FORECASTS_FILE, default=[])
+    latest = sorted(evaluated, key=lambda x: x["origin_ts"])[-1]
 
-    latest_forecast = latest_observation_forecast(pipeline, series_df)
-    latest_origin_ts = latest_forecast["origin_ts"]
+    actuals = np.asarray(latest["actuals"], dtype=float)
+    preds = np.asarray(latest["predictions"], dtype=float)
+    timestamps = pd.to_datetime(latest["actual_timestamps"])
 
-    already_exists = any(f["origin_ts"] == latest_origin_ts for f in forecasts_store)
+    n = min(len(actuals), len(preds), len(timestamps))
+    if n == 0:
+        save_placeholder_plot(
+            LATEST_EVALUATED_PLOT,
+            f"{TICKER} | Latest evaluated forecast",
+            "Evaluated forecast exists, but no plottable data was found."
+        )
+        return
 
-    if not already_exists:
-        forecasts_store.append(latest_forecast)
-        save_latest_forecast_csv(latest_forecast)
-        save_latest_plot(series_df, latest_forecast)
-        print(f"New forecast stored for origin: {latest_origin_ts}")
-    else:
-        print(f"Forecast for origin {latest_origin_ts} already exists. No duplicate added.")
+    actuals = actuals[:n]
+    preds = preds[:n]
+    timestamps = timestamps[:n]
 
-    newly_scored = score_ready_forecasts(series_df, forecasts_store)
-    save_json(FORECASTS_FILE, forecasts_store)
+    latest_smape = latest.get("smape", np.nan)
+    latest_mae = latest.get("mae", np.nan)
+    latest_rmse = latest.get("rmse", np.nan)
 
-    eval_df, summary_df = save_evaluations_csv(forecasts_store)
+    plt.figure(figsize=(12, 5))
+
+    plt.plot(
+        timestamps,
+        actuals,
+        marker="o",
+        linewidth=2,
+        label="Actual Close"
+    )
+
+    plt.plot(
+        timestamps,
+        preds,
+        marker="o",
+        linewidth=2,
+        label="Predicted Close"
+    )
+
+    plt.title(
+        f"{TICKER} | Latest evaluated forecast | "
+        f"sMAPE={latest_smape:.3f}% | MAE={latest_mae:.4f} | RMSE={latest_rmse:.4f}"
+    )
+
+    plt.xlabel("Timestamp")
+    plt.ylabel("Price")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(LATEST_EVALUATED_PLOT, dpi=160)
+    plt.close()
+
+
+# =========================================================
+# MAIN CYCLE
+# =========================================================
+def run_cycle():
+    ensure_state_dir()
+
+    series_df = fetch_price_series()
+    forecasts_store = load_json_list(FORECASTS_JSON)
+    forecasts_store = deduplicate_forecasts(forecasts_store)
+
+    # Create a new forecast only if the latest origin timestamp is not already stored
+    current_origin_ts = normalize_timestamp(series_df.index[-1]).isoformat()
+    existing_origins = {f.get("origin_ts") for f in forecasts_store}
+
+    if current_origin_ts not in existing_origins:
+        new_forecast = generate_forecast(series_df)
+        forecasts_store = maybe_append_new_forecast(forecasts_store, new_forecast)
+
+    # Score all forecasts that now have actual future values available
+    forecasts_store = score_ready_forecasts(series_df, forecasts_store)
+
+    # Save forecasts store
+    save_json(FORECASTS_JSON, forecasts_store)
+
+    # Latest forecast outputs
+    latest_forecast = get_latest_forecast(forecasts_store)
+    save_latest_forecast_csv(latest_forecast)
+    save_latest_plot(series_df, latest_forecast)
+
+    # Evaluation outputs
+    eval_df = build_evaluations_df(forecasts_store)
+    eval_df.to_csv(EVALUATIONS_CSV, index=False)
+    save_evaluation_summary(eval_df)
     save_metrics_plot(eval_df)
+    save_latest_evaluated_forecast_plot(forecasts_store)
 
-    print(f"Newly evaluated forecast blocks this cycle: {len(newly_scored)}")
-    print("\nLatest evaluation summary:")
-    print(summary_df.to_string(index=False))
+    # Console summary
+    print(f"Ticker: {TICKER}")
+    print(f"Rows fetched: {len(series_df)}")
+    print(f"Forecast blocks stored: {len(forecasts_store)}")
+    print(f"Completed/evaluated forecast blocks: {len(eval_df)}")
 
     if not eval_df.empty:
-        print("\nMost recent evaluated blocks:")
-        print(eval_df.tail(5).to_string(index=False))
+        latest_eval = eval_df.iloc[-1]
+        print(
+            "Latest metrics -> "
+            f"MAE={latest_eval['mae']:.4f}, "
+            f"RMSE={latest_eval['rmse']:.4f}, "
+            f"sMAPE={latest_eval['smape']:.3f}%"
+        )
 
-    print("\nSaved files:")
-    print(f"- {FORECASTS_FILE}")
-    print(f"- {LATEST_FORECAST_CSV}")
-    print(f"- {EVALUATIONS_CSV}")
-    print(f"- {SUMMARY_CSV}")
-    print(f"- {LATEST_PLOT}")
-    print(f"- {METRICS_PLOT}")
-
-def main():
-    pipeline = get_pipeline()
-
-    cycle = 0
-    while True:
-        run_cycle(pipeline)
-        cycle += 1
-
-        if not RUN_FOREVER:
-            break
-
-        if MAX_CYCLES is not None and cycle >= MAX_CYCLES:
-            break
-
-        sleep_seconds = POLL_EVERY_MINUTES * 60
-        print(f"Sleeping for {sleep_seconds} seconds...")
-        time.sleep(sleep_seconds)
 
 if __name__ == "__main__":
-    main()
+    run_cycle()
