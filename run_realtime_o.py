@@ -89,13 +89,6 @@ def save_json(path: Path, obj):
         json.dump(obj, f, indent=2)
 
 
-def to_numpy(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-
-    return np.asarray(x)
-
-
 def normalize_timestamp(ts):
     ts = pd.Timestamp(ts)
 
@@ -162,11 +155,7 @@ def fetch_price_series():
     if df is None or df.empty:
         raise RuntimeError("No data returned from Yahoo Finance.")
 
-    # Robust Close extraction for both normal and MultiIndex yfinance outputs.
-    # Sometimes yfinance returns:
-    #   normal columns: Open, High, Low, Close, Volume
-    # and sometimes:
-    #   MultiIndex columns: Close / O, Open / O, etc.
+    # Robust Close extraction for normal and MultiIndex yfinance outputs
     if isinstance(df.columns, pd.MultiIndex):
         if "Close" in df.columns.get_level_values(0):
             close = df["Close"]
@@ -179,8 +168,7 @@ def fetch_price_series():
             raise RuntimeError(f"Close column not found. Columns are: {df.columns}")
         close = df["Close"]
 
-    # If Close is still a DataFrame, keep the first column.
-    # This fixes: AttributeError: 'DataFrame' object has no attribute 'to_frame'
+    # Sometimes Close is DataFrame, not Series
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
 
@@ -213,40 +201,63 @@ def get_pipeline():
         dtype = torch.bfloat16 if use_cuda else torch.float32
         device_map = "cuda" if use_cuda else "cpu"
 
-        _PIPELINE = Chronos2Pipeline.from_pretrained(
-            MODEL_NAME,
-            device_map=device_map,
-            torch_dtype=dtype,
-        )
+        try:
+            _PIPELINE = Chronos2Pipeline.from_pretrained(
+                MODEL_NAME,
+                device_map=device_map,
+                dtype=dtype,
+            )
+        except TypeError:
+            _PIPELINE = Chronos2Pipeline.from_pretrained(
+                MODEL_NAME,
+                device_map=device_map,
+                torch_dtype=dtype,
+            )
 
     return _PIPELINE
 
 
-def extract_predictions_from_chronos_output(forecast_raw):
-    """
-    Makes Chronos output robust.
+def generate_forecast(series_df):
+    pipeline = get_pipeline()
 
-    Expected possible shapes:
-    - Tensor/array with shape: (num_samples, horizon)
-    - Tensor/array with shape: (1, num_samples, horizon)
-    - Tensor/array with shape: (horizon,)
-    - Tuple/list where first element is forecast tensor
-    """
+    context = series_df.tail(CONTEXT_LEN).copy()
 
-    if isinstance(forecast_raw, (tuple, list)):
-        forecast_raw = forecast_raw[0]
+    context_df = pd.DataFrame(
+        {
+            "id": TICKER,
+            "timestamp": context.index,
+            "target": context["target"].values.astype(float),
+        }
+    )
 
-    arr = to_numpy(forecast_raw)
+    # Chronos-2 pandas API
+    pred_df = pipeline.predict_df(
+        context_df,
+        prediction_length=HORIZON_LEN,
+        quantile_levels=[0.1, 0.5, 0.9],
+        id_column="id",
+        timestamp_column="timestamp",
+        target="target",
+    )
 
-    if arr.ndim == 3:
-        arr = arr[0]
+    if pred_df is None or len(pred_df) == 0:
+        raise RuntimeError("Chronos-2 returned an empty prediction DataFrame.")
 
-    if arr.ndim == 2:
-        preds = np.median(arr, axis=0)
-    elif arr.ndim == 1:
-        preds = arr
+    if "timestamp" in pred_df.columns:
+        pred_df = pred_df.sort_values("timestamp")
+
+    # Main point forecast
+    if "predictions" in pred_df.columns:
+        preds = pred_df["predictions"].to_numpy(dtype=float)
+    elif "0.5" in pred_df.columns:
+        preds = pred_df["0.5"].to_numpy(dtype=float)
+    elif 0.5 in pred_df.columns:
+        preds = pred_df[0.5].to_numpy(dtype=float)
     else:
-        raise RuntimeError(f"Unexpected forecast output shape: {arr.shape}")
+        raise RuntimeError(
+            f"Could not find prediction column in Chronos-2 output. "
+            f"Available columns: {list(pred_df.columns)}"
+        )
 
     preds = np.asarray(preds, dtype=float).reshape(-1)
 
@@ -256,22 +267,6 @@ def extract_predictions_from_chronos_output(forecast_raw):
         )
 
     preds = preds[:HORIZON_LEN]
-    return preds
-
-
-def generate_forecast(series_df):
-    pipeline = get_pipeline()
-
-    context_values = series_df["target"].values.astype(np.float32)[-CONTEXT_LEN:]
-    context_tensor = torch.tensor(context_values)
-
-    forecast_raw = pipeline.predict(
-        context=context_tensor,
-        prediction_length=HORIZON_LEN,
-        num_samples=NUM_SAMPLES,
-    )
-
-    preds = extract_predictions_from_chronos_output(forecast_raw)
 
     origin_ts = normalize_timestamp(series_df.index[-1])
 
@@ -346,7 +341,7 @@ def score_ready_forecasts(series_df, forecasts_store):
 
         origin_pos = index_map[origin_ts]
 
-        # Need full actual block of length HORIZON_LEN after the forecast origin.
+        # Need full actual block of length HORIZON_LEN after the forecast origin
         if origin_pos + HORIZON_LEN >= len(series_df):
             continue
 
